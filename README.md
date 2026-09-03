@@ -33,51 +33,160 @@ Google AI Studio?“*
 
 ## Installation
 
-Voraussetzung: Python ≥ 3.10 und ein OpenRouter-API-Key
+Voraussetzung: Python ≥ 3.10, [uv](https://docs.astral.sh/uv/) und ein OpenRouter-API-Key
 (<https://openrouter.ai/settings/keys>).
 
+Der Repo-Zugang hängt davon ab, ob das Repository öffentlich oder privat ist – das
+entscheidet weiter unten auch über die möglichen `.mcp.json`-Varianten:
+
+| Repo | Klonen | Anonymer HTTPS-Zugriff |
+| --- | --- | --- |
+| **öffentlich** | `git clone https://github.com/sneffets/openrouter-image-mcp.git` | funktioniert |
+| **privat** | `git clone git@github.com:sneffets/openrouter-image-mcp.git` | scheitert – GitHub antwortet Unbeteiligten mit `404` |
+
 ```bash
-git clone https://github.com/sneffets/openrouter-image-mcp.git
+git clone <URL aus der Tabelle>
 cd openrouter-image-mcp
-uv venv && uv pip install -e .
-# oder klassisch:
-python -m venv .venv && .venv/bin/pip install -e .
+uv sync
 ```
 
-Ohne Checkout geht auch direkt:
+`uv sync` legt `.venv/` an und installiert Paket samt Abhängigkeiten. Klassisch geht auch:
 
 ```bash
-uvx --from git+https://github.com/sneffets/openrouter-image-mcp openrouter-image-mcp
+python3 -m venv .venv && .venv/bin/pip install -e .
+```
+
+Smoke-Test – der Server muss auf `initialize` antworten:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+  | uv run --project . openrouter-image-mcp
 ```
 
 ## Einrichtung in Claude Code
 
-```bash
-claude mcp add openrouter-image \
-  --env OPENROUTER_API_KEY=sk-or-v1-... \
-  --env OPENROUTER_IMAGE_MODEL=google/gemini-3.1-flash-image \
-  --env OPENROUTER_IMAGE_OUTPUT_DIR=./design/images \
-  -- /pfad/zu/openrouter-image-mcp/.venv/bin/openrouter-image-mcp
-```
+Drei Wege, den Server zu starten. Variante A funktioniert immer, B hängt an der
+Sichtbarkeit des Repos:
 
-Oder direkt in `.mcp.json` im Projekt (damit das ganze Team den Server bekommt):
+| Variante | Wann sinnvoll | Repo-Sichtbarkeit |
+| --- | --- | --- |
+| **A** – lokaler Checkout über `uv run --project` | Entwicklung am Server selbst, verlässlichster Weg | egal |
+| **B** – direkt aus GitHub über `uvx --from git+…` | ohne Checkout, z. B. für Kolleg:innen | öffentlich: `https`, privat: `ssh` + Zugriff |
+| **C** – venv-Binary direkt | wenn kein uv im Spiel sein soll | egal |
+
+### A – Lokaler Checkout (empfohlen)
 
 ```json
 {
   "mcpServers": {
     "openrouter-image": {
-      "command": "uvx",
-      "args": ["--from", "git+https://github.com/sneffets/openrouter-image-mcp", "openrouter-image-mcp"],
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "/absoluter/pfad/zu/openrouter-image-mcp",
+        "openrouter-image-mcp"
+      ],
       "env": {
-        "OPENROUTER_API_KEY": "sk-or-v1-...",
-        "OPENROUTER_IMAGE_OUTPUT_DIR": "./design/images"
+        "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}",
+        "OPENROUTER_IMAGE_MODEL": "google/gemini-3.1-flash-image",
+        "OPENROUTER_IMAGE_OUTPUT_DIR": "/absoluter/pfad/zum/projekt/design/images"
       }
     }
   }
 }
 ```
 
-Prüfen mit `/mcp` in Claude Code – der Server heißt `openrouter-image`.
+### B – Direkt aus GitHub, ohne Checkout
+
+**Öffentliches Repo:**
+
+```json
+"command": "uvx",
+"args": ["--from", "git+https://github.com/sneffets/openrouter-image-mcp", "openrouter-image-mcp"]
+```
+
+**Privates Repo** – nur mit SSH-Key, der Zugriff hat:
+
+```json
+"command": "uvx",
+"args": ["--from", "git+ssh://git@github.com/sneffets/openrouter-image-mcp", "openrouter-image-mcp"]
+```
+
+Die HTTPS-Schreibweise auf einem privaten Repo ist der klassische Fehlschlag: uv fetcht
+ohne Anmeldung und bricht mit
+`fatal: could not read Username for 'https://github.com': terminal prompts disabled` ab –
+in Claude Code sichtbar nur als `CONNECTION_CLOSED`.
+
+Beide Varianten ziehen standardmäßig den **Stand des Default-Branch**. Für reproduzierbare
+Setups an einen Tag oder Commit pinnen:
+
+```
+git+https://github.com/sneffets/openrouter-image-mcp@v0.1.0
+```
+
+> **Ist eine GitHub-URL in `.mcp.json` üblich?** Verbreitet, aber nicht der Normalfall. Die
+> Mehrheit der MCP-Server wird über eine Registry gestartet – `npx -y @scope/paket` bei
+> Node, `uvx paketname` bei Python auf PyPI. Die `git+…`-Form ist die Notlösung für alles,
+> was (noch) nicht veröffentlicht ist: sie funktioniert, kostet aber Versionierung
+> (ohne `@tag` immer HEAD), braucht Git plus Netz bei jedem Kaltstart und bei privaten
+> Repos zusätzlich Auth. Für einen Server, den du selbst entwickelst, ist Variante A
+> deshalb meist die bessere Wahl; `git+…` lohnt sich, sobald andere ihn ohne Checkout
+> benutzen sollen.
+
+### C – venv-Binary direkt
+
+```bash
+claude mcp add openrouter-image \
+  --env OPENROUTER_API_KEY=sk-or-v1-... \
+  --env OPENROUTER_IMAGE_MODEL=google/gemini-3.1-flash-image \
+  --env OPENROUTER_IMAGE_OUTPUT_DIR="$PWD/design/images" \
+  -- /pfad/zu/openrouter-image-mcp/.venv/bin/openrouter-image-mcp
+```
+
+### Fallstricke
+
+- **`--project`, nicht `--directory`.** `--directory` wechselt das Arbeitsverzeichnis in
+  den Server-Ordner – ein relatives `OPENROUTER_IMAGE_OUTPUT_DIR=./design/images` landet
+  dann im Server-Repo statt im eigenen Projekt. `--project` benutzt nur dessen venv und
+  lässt das Arbeitsverzeichnis stehen.
+- **Output-Verzeichnis absolut angeben**, wenn du sicher sein willst, wo die Bilder landen.
+- **Key nicht im Klartext.** `${OPENROUTER_API_KEY}` wird aus der Umgebung expandiert;
+  eine `.mcp.json` wird üblicherweise eingecheckt.
+
+Prüfen mit `/mcp` in Claude Code – der Server heißt `openrouter-image`. Nach Änderungen an
+`.mcp.json` muss Claude Code neu gestartet oder der Server über `/mcp` neu verbunden werden.
+
+## Troubleshooting
+
+**`CONNECTION_CLOSED` bzw. „Connection closed" beim Start**
+
+Der Prozess ist gestorben, bevor der MCP-Handshake überhaupt stattfand – die Ursache liegt
+also im Startbefehl, nicht im Server. Zum Nachsehen den Befehl aus `.mcp.json` von Hand
+ausführen und auf stderr schauen:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+  | uv run --project /pfad/zu/openrouter-image-mcp openrouter-image-mcp
+```
+
+| Meldung | Ursache |
+| --- | --- |
+| `could not read Username for 'https://github.com'` | `git+https://` auf ein privates Repo – auf `git+ssh://` wechseln (Variante B) oder lokal klonen (Variante A) |
+| `No such file or directory: uv` / `uvx` | uv nicht im `PATH` des Clients; absoluten Pfad zur uv-Binary eintragen |
+| `Failed to spawn: openrouter-image-mcp` | Paket nicht installiert – `uv sync` im Checkout nachholen |
+| `ModuleNotFoundError` | Server läuft gegen ein fremdes venv; `--project` auf den Checkout zeigen lassen |
+
+**Server startet, aber jeder Tool-Aufruf schlägt fehl**
+
+`openrouter_status()` aufrufen – es zeigt die geladene Konfiguration und die Credits des
+Keys. `OPENROUTER_API_KEY is not set` heißt, dass der `env`-Block nicht ankommt.
+
+**Bilder landen im falschen Ordner**
+
+Relatives `OPENROUTER_IMAGE_OUTPUT_DIR` plus `uv run --directory` – siehe oben. Wo der
+Server tatsächlich hinschreibt, sagt `openrouter_status()`; einzelne Aufrufe überschreiben
+das per `save_dir`.
 
 ## Konfiguration
 
