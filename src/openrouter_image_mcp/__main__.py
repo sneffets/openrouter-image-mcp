@@ -10,7 +10,7 @@ import sys
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="openrouter-image-mcp",
-        description="MCP server for image generation via OpenRouter.",
+        description="MCP server for image and video generation via OpenRouter.",
     )
     parser.add_argument(
         "--transport",

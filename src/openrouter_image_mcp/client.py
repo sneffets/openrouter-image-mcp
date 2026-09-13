@@ -76,15 +76,21 @@ class OpenRouterClient:
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         allow_status: frozenset[int] = frozenset(),
+        idempotent: bool = True,
     ) -> tuple[int, Any]:
         """Perform a request and return ``(status_code, parsed_body)``.
 
         Statuses listed in ``allow_status`` are returned to the caller instead of
         raising, which is how the fallback from ``/images`` to
         ``/chat/completions`` is implemented.
+
+        ``idempotent=False`` is for calls that start paid jobs: only a 429 (rejected
+        before any work started) is retried, never a timeout or a 5xx, because the
+        job may already be running and a retry would pay for it twice.
         """
         url = f"{self.settings.base_url}/{path.lstrip('/')}"
         headers = self.settings.headers()
+        retry_status = RETRY_STATUS if idempotent else frozenset({429})
         last_error: Exception | None = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -99,20 +105,20 @@ class OpenRouterClient:
                 )
             except httpx.TimeoutException as exc:
                 last_error = exc
-                if attempt == MAX_ATTEMPTS:
+                if attempt == MAX_ATTEMPTS or not idempotent:
                     raise OpenRouterError(
                         f"Request to {url} timed out after {self.settings.timeout:.0f}s. "
                         "Image models can be slow - raise OPENROUTER_IMAGE_TIMEOUT if needed."
                     ) from exc
             except httpx.HTTPError as exc:
                 last_error = exc
-                if attempt == MAX_ATTEMPTS:
+                if attempt == MAX_ATTEMPTS or not idempotent:
                     raise OpenRouterError(f"Could not reach {url}: {exc}") from exc
             else:
                 if response.status_code in allow_status:
                     return response.status_code, _safe_json(response)
                 if response.status_code >= 400:
-                    if response.status_code in RETRY_STATUS and attempt < MAX_ATTEMPTS:
+                    if response.status_code in retry_status and attempt < MAX_ATTEMPTS:
                         await asyncio.sleep(BACKOFF_BASE**attempt)
                         continue
                     raise OpenRouterError(
@@ -192,6 +198,44 @@ class OpenRouterClient:
         media_type = response.headers.get("content-type", "image/png").split(";")[0].strip()
         return response.content, media_type
 
+    # ----------------------------------------------------------------- video
+
+    async def list_video_models(self) -> list[dict[str, Any]]:
+        _, body = await self.request("GET", "/videos/models")
+        return _as_list(body)
+
+    async def create_video(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Submit a video job; returns ``{id, polling_url, status}``."""
+        _, body = await self.request("POST", "/videos", json_body=payload, idempotent=False)
+        if not isinstance(body, dict) or not body.get("id"):
+            raise OpenRouterError(f"OpenRouter did not return a video job id: {body!r}"[:500])
+        return body
+
+    async def get_video_job(self, job_id: str) -> dict[str, Any]:
+        _, body = await self.request("GET", f"/videos/{job_id}")
+        return body if isinstance(body, dict) else {}
+
+    async def download_video(
+        self, job_id: str, index: int = 0, url: str | None = None
+    ) -> tuple[bytes, str]:
+        """Fetch a finished video. OpenRouter content URLs are not presigned, so they
+        get the API key; foreign storage URLs are fetched without it."""
+        target = url or f"{self.settings.base_url}/videos/{job_id}/content?index={index}"
+        headers = self.settings.headers() if _is_openrouter_url(target, self.settings) else None
+        try:
+            response = await self._client.get(
+                target, headers=headers, timeout=self.settings.timeout, follow_redirects=True
+            )
+        except httpx.HTTPError as exc:
+            raise OpenRouterError(f"Could not download the video from {target}: {exc}") from exc
+        if response.status_code >= 400:
+            raise OpenRouterError(
+                f"Video download returned {response.status_code}: {_error_message(response)}",
+                status_code=response.status_code,
+            )
+        media_type = response.headers.get("content-type", "video/mp4").split(";")[0].strip()
+        return response.content, media_type
+
 
 def to_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Translate an ``/images`` payload into a ``/chat/completions`` payload."""
@@ -221,6 +265,10 @@ def to_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("seed") is not None:
         chat["seed"] = payload["seed"]
     return chat
+
+
+def _is_openrouter_url(url: str, settings: Settings) -> bool:
+    return url.startswith((settings.base_url, "https://openrouter.ai/api/"))
 
 
 def _safe_json(response: httpx.Response) -> Any:

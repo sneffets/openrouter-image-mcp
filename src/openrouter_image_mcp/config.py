@@ -11,6 +11,8 @@ DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OUTPUT_DIR = "openrouter-images"
 DEFAULT_TIMEOUT = 180.0
 DEFAULT_PREVIEW_MAX_PX = 768
+DEFAULT_VIDEO_POLL_INTERVAL = 15.0
+DEFAULT_VIDEO_MAX_WAIT = 600.0
 DEFAULT_APP_TITLE = "openrouter-image-mcp"
 DEFAULT_APP_URL = "https://github.com/sneffets/openrouter-image-mcp"
 
@@ -75,12 +77,22 @@ class Settings:
     preview_max_px: int = DEFAULT_PREVIEW_MAX_PX
     app_title: str = DEFAULT_APP_TITLE
     app_url: str = DEFAULT_APP_URL
+    default_video_model: str | None = None
+    # None means "same directory as the images".
+    video_output_dir: Path | None = None
+    video_poll_interval: float = DEFAULT_VIDEO_POLL_INTERVAL
+    video_max_wait: float = DEFAULT_VIDEO_MAX_WAIT
+
+    @property
+    def videos_dir(self) -> Path:
+        return self.video_output_dir or self.output_dir
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         env = os.environ if env is None else env
         base_url = (env.get("OPENROUTER_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
         output_dir = Path(env.get("OPENROUTER_IMAGE_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR).expanduser()
+        video_dir = (env.get("OPENROUTER_VIDEO_OUTPUT_DIR") or "").strip()
         api_key = (env.get("OPENROUTER_API_KEY") or "").strip() or None
         return cls(
             api_key=api_key,
@@ -95,6 +107,12 @@ class Settings:
             preview_max_px=_int(env, "OPENROUTER_IMAGE_PREVIEW_MAX_PX", DEFAULT_PREVIEW_MAX_PX),
             app_title=(env.get("OPENROUTER_APP_TITLE") or DEFAULT_APP_TITLE).strip(),
             app_url=(env.get("OPENROUTER_APP_URL") or DEFAULT_APP_URL).strip(),
+            default_video_model=(env.get("OPENROUTER_VIDEO_MODEL") or "").strip() or None,
+            video_output_dir=Path(video_dir).expanduser() if video_dir else None,
+            video_poll_interval=_float(
+                env, "OPENROUTER_VIDEO_POLL_INTERVAL", DEFAULT_VIDEO_POLL_INTERVAL
+            ),
+            video_max_wait=_float(env, "OPENROUTER_VIDEO_MAX_WAIT", DEFAULT_VIDEO_MAX_WAIT),
         )
 
     def require_api_key(self) -> str:

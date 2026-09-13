@@ -1,8 +1,9 @@
 # openrouter-image-mcp
 
-Ein **MCP-Server (Python)** für **Bildgenerierung über [OpenRouter](https://openrouter.ai)** –
-gebaut für den Einsatz in **Claude Code**, sowohl in Design-Sessions als auch beim Coden
-(Icons, Placeholder-Assets, Mockups, OG-Images …).
+Ein **MCP-Server (Python)** für **Bild- und Videogenerierung über
+[OpenRouter](https://openrouter.ai)** – gebaut für den Einsatz in **Claude Code**, sowohl in
+Design-Sessions als auch beim Coden (Icons, Placeholder-Assets, Mockups, OG-Images, Hero-Loops,
+Produktclips …).
 
 Modelle **und** Provider sind zur Laufzeit auflistbar und auswählbar: Der Server rät nicht,
 sondern liefert eine Kandidatenliste zurück bzw. fragt per MCP-Elicitation nach, wenn kein
@@ -30,6 +31,10 @@ Google AI Studio?“*
 - **Robust** – Retries mit Backoff auf 429/5xx, sprechende Fehlermeldungen aus dem
   OpenRouter-Error-Body, automatischer Fallback von `POST /api/v1/images` auf
   `POST /api/v1/chat/completions` mit `modalities: ["image","text"]`.
+- **Video** – `generate_video` für Text-zu-Video, Bild-zu-Video (erstes/letztes Frame),
+  Referenz-zu-Video mit Bildern, Videos und Tonspuren; `edit_video` zum Editieren,
+  Umstylen und Upscalen vorhandener Clips. Veo 3.1, Kling 3.0, Seedance 2.x, Sora 2, Wan,
+  Hailuo, Runway, FLUX Video … – Details im Abschnitt [Video](#video).
 
 ## Installation
 
@@ -202,7 +207,11 @@ Alles über Environment-Variablen (siehe `.env.example`):
 | `OPENROUTER_IMAGE_OUTPUT_DIR` | `./openrouter-images` | Zielverzeichnis für generierte Bilder |
 | `OPENROUTER_IMAGE_INLINE_PREVIEW` | `true` | Verkleinerte Vorschau im Tool-Ergebnis |
 | `OPENROUTER_IMAGE_PREVIEW_MAX_PX` | `768` | Kantenlänge der Vorschau |
-| `OPENROUTER_IMAGE_TIMEOUT` | `180` | HTTP-Timeout in Sekunden |
+| `OPENROUTER_IMAGE_TIMEOUT` | `180` | HTTP-Timeout in Sekunden (auch für Video-Downloads) |
+| `OPENROUTER_VIDEO_MODEL` | – | Default-Videomodell. Ohne Wert wird nach dem Modell gefragt |
+| `OPENROUTER_VIDEO_OUTPUT_DIR` | wie Bilder | Zielverzeichnis für Videos |
+| `OPENROUTER_VIDEO_POLL_INTERVAL` | `15` | Sekunden zwischen zwei Status-Abfragen eines Video-Jobs |
+| `OPENROUTER_VIDEO_MAX_WAIT` | `600` | So lange wartet ein Tool-Aufruf maximal auf ein Video |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | API-Basis-URL |
 | `OPENROUTER_APP_TITLE` / `OPENROUTER_APP_URL` | Projektname/-URL | Attribution-Header für OpenRouter |
 
@@ -217,9 +226,16 @@ Alles über Environment-Variablen (siehe `.env.example`):
 | `edit_image(prompt, reference_images, …)` | Bestehende Bilder editieren/variieren |
 | `show_image(path, max_pixels)` | Beliebiges lokales Bild inline anzeigen |
 | `list_generated_images(limit)` | Zuletzt erzeugte Bilder im Output-Verzeichnis |
+| `list_video_models(query, limit, refresh)` | Videomodelle mit Preis, Längen, Auflösungen, Frames, Audio |
+| `describe_video_model(model)` | Alles, was ein Videomodell kann, inkl. `provider_options` |
+| `generate_video(prompt, model, …)` | Video erzeugen, warten, speichern, Frame-Vorschau liefern |
+| `edit_video(source_video, prompt, …)` | Clip editieren, umstylen oder upscalen |
+| `check_video_job(job_id)` | Laufenden Job weiter abwarten und herunterladen |
+| `list_generated_videos(limit)` | Offene Jobs + zuletzt gespeicherte Videos |
+| `show_video(path)` | Lokales Video inspizieren (Länge, Auflösung, Audio, 4-Frame-Vorschau) |
 | `openrouter_status()` | Konfiguration + Credit-/Limit-Infos des Keys |
 
-Zusätzlich als Ressource: `openrouter://image-models`.
+Zusätzlich als Ressourcen: `openrouter://image-models` und `openrouter://video-models`.
 
 `generate_image` reicht die normalisierten OpenRouter-Parameter durch: `aspect_ratio`,
 `resolution`, `quality`, `output_format`, `background`, `seed`, `n` sowie `extra_body` als
@@ -251,6 +267,105 @@ Escape-Hatch für alles Weitere. Welche ein Modell wirklich unterstützt, sagt
 > nach `assets/`.“
 > → `generate_image(..., background="transparent", save_dir="assets")`
 
+## Video
+
+Videos laufen bei OpenRouter als **asynchrone Jobs** (`POST /api/v1/videos` → Status pollen →
+Download). Der Server nimmt dir das ab: `generate_video` schickt den Job ab, meldet
+Fortschritt per MCP-Progress, lädt das fertige Video herunter und legt es samt
+`*.json`-Sidecar ab.
+
+### Was geht
+
+| Modus | Parameter | Hinweis |
+| --- | --- | --- |
+| Text-zu-Video | `prompt` | alle Modelle |
+| Bild-zu-Video | `first_frame`, `last_frame` | Start- und/oder Endbild; welche Frames gehen, zeigt `describe_video_model` |
+| Referenzbilder | `reference_images` | Figuren, Produkte, Stil – lose Vorgabe statt exaktem Frame |
+| Referenzvideos | `reference_videos` | Bewegung, Kamera, Effekt-Vorlage, Clip fortsetzen |
+| Tonspuren | `reference_audios` | Musik, Sound, Stimme, auf die das Video abgestimmt wird |
+| Ton erzeugen | `generate_audio` | Veo, Kling, Seedance, Wan, Sora … erzeugen passenden Ton |
+| Editieren/Upscalen | `edit_video(source_video, …)`, `upscale_factor`, `creativity` | z. B. FLUX Video Edit, Runway Aleph, FLUX Video Upscale |
+| Format | `duration`, `resolution`, `aspect_ratio`, `size`, `seed` | werden vor dem Absenden gegen das Modell geprüft |
+| Modellspezifisch | `provider_options`, `negative_prompt` | z. B. `personGeneration` bei Veo, `cfg_scale` bei Kling |
+
+Alle Eingaben akzeptieren lokale Pfade, http-URLs oder Data-URLs. Lokale Dateien werden
+inline mitgeschickt (Video bis 50 MB, Audio bis 20 MB) – für große Clips ist eine öffentliche
+URL robuster. **Video- und Audio-Referenzen werden nur von Modellen berücksichtigt, die das
+können** (laut OpenRouter u. a. Seedance ab Generation 2); andere ignorieren sie stillschweigend.
+
+`negative_prompt` wird automatisch auf die Schreibweise des Modells gemappt (`negativePrompt`
+bei Veo, `negative_prompt` bei Kling/Wan) und wie alle `provider_options` unter
+`provider.options.<provider>.parameters` einsortiert – den Provider sucht der Server selbst.
+Unbekannte Optionen, falsche Längen oder nicht unterstützte Frames werden **vor** dem
+kostenpflichtigen Request abgelehnt, mit der Liste der erlaubten Werte. Wer es trotzdem
+schicken will: `extra_body`.
+
+### Aktuelle Top-Modelle (Stand 2026-09-13)
+
+| | Veo 3.1 | Kling 3.0 Pro | Seedance 2.5 |
+| --- | --- | --- | --- |
+| Slug | `google/veo-3.1` | `kwaivgi/kling-v3.0-pro` | `bytedance/seedance-2.5` |
+| Länge | 4, 6, 8 s | 3–15 s | 4–30 s |
+| Auflösung | 720p, 1080p, 4K | 720p | 480p, 720p |
+| Seitenverhältnis | 16:9, 9:16 | 16:9, 9:16, 1:1 | 16:9, 4:3, 1:1, 3:4, 9:16, 21:9 |
+| Erstes/letztes Frame | ✓ / ✓ | ✓ / ✓ | ✓ / ✓ |
+| Ton erzeugen | ✓ | ✓ | ✓ |
+| Seed | ✓ | – | ✓ |
+| Video-/Audio-Referenzen | – | – | ✓ |
+| `provider_options` | `personGeneration`, `negativePrompt`, `enhancePrompt`, `conditioningScale`, `aspectRatio` | `negative_prompt`, `cfg_scale` | `watermark`, `req_key`, `output_format` |
+| Preis | $0.20/s ohne, $0.40/s mit Ton (4K: $0.40/$0.60) | $0.112/s, mit Ton $0.168/s | $10.70 / M Video-Tokens |
+
+Günstigere Varianten: `google/veo-3.1-fast`, `google/veo-3.1-lite`, `kwaivgi/kling-v3.0-std`,
+`bytedance/seedance-2.0-fast`/`-mini`. Die Tabelle ist eine Momentaufnahme –
+`list_video_models` und `describe_video_model` zeigen immer den Live-Stand.
+
+### Warten, Timeouts, Kosten
+
+- Ein Video braucht **30 Sekunden bis mehrere Minuten**. `generate_video` wartet bis zu
+  `OPENROUTER_VIDEO_MAX_WAIT` (Default 600 s, pro Aufruf über `max_wait_seconds`).
+- Ist der Job dann noch nicht fertig, kommt statt eines Fehlers die **Job-ID** zurück. Der Job
+  läuft bei OpenRouter weiter; `check_video_job(job_id=…)` wartet weiter und lädt herunter.
+  **Nicht neu absenden** – das kostet doppelt. Offene Jobs listet `list_generated_videos`.
+- Mit `wait=false` wird nur abgeschickt – praktisch, um mehrere Varianten parallel zu starten.
+- Jobs werden unter `<Video-Verzeichnis>/.video-jobs/` gemerkt und überleben so auch einen
+  Neustart des Servers.
+- Der Job-Start wird bewusst **nicht automatisch wiederholt** (außer bei 429), damit ein
+  Timeout nicht zu einem zweiten bezahlten Video führt.
+- Ist **ffmpeg** installiert, gibt es als Vorschau ein 2×2-Raster aus vier gleichmäßig
+  verteilten Frames plus Länge/Auflösung/Tonspur-Info. Ohne ffmpeg funktioniert alles andere
+  genauso, nur ohne Vorschau.
+
+### Beispiele
+
+**Text-zu-Video mit Ton**
+
+> `generate_video(prompt="Langsame Kamerafahrt über eine neblige Berglandschaft bei
+>  Sonnenaufgang, Vogelgezwitscher", model="google/veo-3.1", duration=8,
+>  resolution="1080p", aspect_ratio="16:9", generate_audio=true,
+>  negative_prompt="Text, Wasserzeichen")`
+
+**Hero-Image animieren (Start- und Endbild)**
+
+> `generate_video(prompt="Das Produkt dreht sich einmal langsam um die eigene Achse",
+>  model="kwaivgi/kling-v3.0-pro", first_frame="design/images/hero.png",
+>  last_frame="design/images/hero-back.png", duration=5,
+>  provider_options={"cfg_scale": 0.6})`
+
+**Referenzen kombinieren: Figur + Bewegungsvorlage + Musik**
+
+> `generate_video(prompt="Die Figur aus dem Bild tanzt wie im Referenzclip, im Takt der Musik",
+>  model="bytedance/seedance-2.5", reference_images=["assets/figur.png"],
+>  reference_videos=["https://example.com/tanz.mp4"], reference_audios=["assets/beat.mp3"],
+>  duration=10, aspect_ratio="9:16")`
+
+**Clip editieren und hochskalieren**
+
+> `edit_video(source_video="clips/demo.mp4", prompt="gleiche Szene, aber bei Nacht im Regen",
+>  model="black-forest-labs/flux-video-edit")`
+>
+> `edit_video(source_video="clips/demo-night.mp4", model="black-forest-labs/flux-video-upscale",
+>  upscale_factor=2, creativity=0)`
+
 ## Modell- und Provider-Auswahl
 
 1. Ist `model` gesetzt, wird es benutzt – Slug oder Klarname (`"nano banana 2"`) sind ok.
@@ -281,6 +396,8 @@ Aufbau:
 | `imaging.py` | Speichern, Sidecars, Vorschauen, Referenzbilder |
 | `catalog.py` | Modell-/Provider-Discovery samt Cache und Formatierung |
 | `generation.py` | Request-Bau und Persistenz |
+| `media.py` | Video-/Audio-Inputs, ffprobe-Infos, Frame-Vorschau per ffmpeg |
+| `video.py` | Video-Requests, Validierung gegen Modellfähigkeiten, Polling, Job-Records, Download |
 | `server.py` | MCP-Tools |
 
 ## Lizenz

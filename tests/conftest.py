@@ -36,6 +36,7 @@ def settings(tmp_path: Path) -> Settings:
         base_url="https://openrouter.test/api/v1",
         output_dir=tmp_path / "images",
         timeout=5.0,
+        video_poll_interval=0.0,
     )
 
 

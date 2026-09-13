@@ -16,7 +16,7 @@ class ModelNotFoundError(LookupError):
     """Raised when a requested model slug cannot be matched to an image model."""
 
     def __init__(self, query: str, candidates: Sequence[dict[str, Any]]) -> None:
-        super().__init__(f"No image model matches {query!r}.")
+        super().__init__(f"No model matches {query!r}.")
         self.query = query
         self.candidates = list(candidates)
 
@@ -126,18 +126,31 @@ class ModelCatalog:
 
     async def resolve(self, query: str, *, refresh: bool = False) -> dict[str, Any]:
         """Resolve a slug or a friendly name (``"nano banana 2"``) to one model."""
-        models = await self.image_models(refresh=refresh)
-        wanted = query.strip().lower()
-        for model in models:
-            if model_slug(model).lower() == wanted:
-                return model
-        matches = filter_models(models, query)
-        exact_names = [m for m in matches if model_name(m).lower() == wanted]
-        if exact_names:
-            return exact_names[0]
-        if len(matches) == 1:
-            return matches[0]
-        raise ModelNotFoundError(query, matches or models)
+        return resolve_model(await self.image_models(refresh=refresh), query)
+
+    async def video_models(self, *, refresh: bool = False) -> list[dict[str, Any]]:
+        return await self._cached("video_models", self._client.list_video_models, refresh)
+
+    async def search_videos(self, query: str, *, refresh: bool = False) -> list[dict[str, Any]]:
+        return filter_models(await self.video_models(refresh=refresh), query)
+
+    async def resolve_video(self, query: str, *, refresh: bool = False) -> dict[str, Any]:
+        """Resolve a slug or a friendly name (``"veo 3.1"``) to one video model."""
+        return resolve_model(await self.video_models(refresh=refresh), query)
+
+
+def resolve_model(models: Sequence[dict[str, Any]], query: str) -> dict[str, Any]:
+    wanted = query.strip().lower()
+    for model in models:
+        if model_slug(model).lower() == wanted:
+            return model
+    matches = filter_models(models, query)
+    exact_names = [m for m in matches if model_name(m).lower() == wanted]
+    if exact_names:
+        return exact_names[0]
+    if len(matches) == 1:
+        return matches[0]
+    raise ModelNotFoundError(query, matches or models)
 
 
 def filter_models(models: Iterable[dict[str, Any]], query: str) -> list[dict[str, Any]]:
@@ -223,6 +236,121 @@ def format_model_details(model: dict[str, Any]) -> str:
     params = _supported_parameters(model)
     if params:
         lines.append(f"- **supported parameters**: {', '.join(sorted(params))}")
+    description = model.get("description")
+    if isinstance(description, str) and description.strip():
+        lines += ["", description.strip()[:800]]
+    return "\n".join(lines)
+
+
+def _video_price(model: dict[str, Any]) -> str:
+    """Condense ``pricing_skus`` into a rough per-second (or per-token) hint."""
+    skus = model.get("pricing_skus")
+    if not isinstance(skus, dict) or not skus:
+        return "-"
+    per_second: list[float] = []
+    per_megapixel_second: list[float] = []
+    per_token: dict[str, float] = {}
+    for key, raw in skus.items():
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        in_usd = value / 100 if key.startswith("cents_per") else value
+        if "video_tokens" in key:
+            per_token[key] = value
+        elif "megapixel" in key:
+            per_megapixel_second.append(in_usd)
+        elif (key.startswith("cents_per") and "second" in key) or "duration_seconds" in key:
+            per_second.append(in_usd)
+    if per_second:
+        return f"{_usd_span(per_second)}/s"
+    if per_megapixel_second:
+        return f"{_usd_span(per_megapixel_second)}/megapixel-s"
+    if per_token:
+        # Discounted SKUs (e.g. with video input) exist too; the base price is the honest hint.
+        base = per_token.get("video_tokens", min(per_token.values()))
+        return f"{_usd(base, per_million=True)}/M video tokens"
+    return ", ".join(f"{k}={v}" for k, v in list(skus.items())[:2])
+
+
+def _usd_span(values: list[float]) -> str:
+    low, high = min(values), max(values)
+    return _usd(low) if low == high else f"{_usd(low)}-{_usd(high)}"
+
+
+def _choices(values: Any, *, compact: bool = False) -> str:
+    if not isinstance(values, list) or not values:
+        return "-"
+    if compact and all(isinstance(v, int) for v in values):
+        ordered = sorted(values)
+        if len(ordered) > 3 and ordered == list(range(ordered[0], ordered[-1] + 1)):
+            return f"{ordered[0]}-{ordered[-1]}s"
+        return ", ".join(map(str, ordered)) + "s"
+    return ", ".join(map(str, values))
+
+
+def video_inputs(model: dict[str, Any]) -> str:
+    frames = model.get("supported_frame_images") or []
+    parts = []
+    if "first_frame" in frames:
+        parts.append("first frame")
+    if "last_frame" in frames:
+        parts.append("last frame")
+    if model.get("upscale_factor"):
+        parts.append("video (upscale)")
+    return ", ".join(parts) or "-"
+
+
+def format_video_model_table(
+    models: Sequence[dict[str, Any]], *, limit: int | None = None
+) -> str:
+    shown = list(models)[:limit] if limit else list(models)
+    if not shown:
+        return "No video models matched."
+    lines = [
+        "| model (use this slug) | name | price | durations | resolutions | frames | audio |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for model in shown:
+        audio = {True: "yes", False: "no"}.get(model.get("generate_audio"), "?")
+        lines.append(
+            f"| `{model_slug(model)}` | {model_name(model)} | {_video_price(model)} | "
+            f"{_choices(model.get('supported_durations'), compact=True)} | "
+            f"{_choices(model.get('supported_resolutions'))} | {video_inputs(model)} | {audio} |"
+        )
+    if limit and len(models) > limit:
+        lines.append("")
+        lines.append(f"... {len(models) - limit} more; narrow the search with `query`.")
+    return "\n".join(lines)
+
+
+def format_video_model_details(model: dict[str, Any]) -> str:
+    lines = [
+        f"# {model_name(model)}",
+        "",
+        f"- **slug**: `{model_slug(model)}`",
+        f"- **price**: {_video_price(model)}",
+        f"- **durations**: {_choices(model.get('supported_durations'))}",
+        f"- **resolutions**: {_choices(model.get('supported_resolutions'))}",
+        f"- **aspect ratios**: {_choices(model.get('supported_aspect_ratios'))}",
+        f"- **sizes**: {_choices(model.get('supported_sizes'))}",
+        f"- **frame images**: {_choices(model.get('supported_frame_images'))}",
+        f"- **generates audio**: {model.get('generate_audio')}",
+        f"- **seed**: {model.get('seed')}",
+    ]
+    upscale = model.get("upscale_factor")
+    if isinstance(upscale, dict):
+        lines.append(f"- **upscale factor**: {upscale.get('min')}-{upscale.get('max')}")
+    if model.get("creativity"):
+        lines.append(f"- **creativity**: {_choices(model.get('creativity'))}")
+    passthrough = model.get("allowed_passthrough_parameters")
+    lines.append(
+        "- **provider_options (passthrough)**: "
+        + (", ".join(f"`{p}`" for p in passthrough) if passthrough else "none")
+    )
+    skus = model.get("pricing_skus")
+    if isinstance(skus, dict) and skus:
+        lines.append("- **pricing SKUs**: " + ", ".join(f"{k}={v}" for k, v in skus.items()))
     description = model.get("description")
     if isinstance(description, str) and description.strip():
         lines += ["", description.strip()[:800]]

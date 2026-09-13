@@ -1,7 +1,9 @@
-"""MCP server exposing OpenRouter image generation to Claude Code and other clients."""
+"""MCP server exposing OpenRouter image and video generation to Claude Code and other clients."""
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import logging
 from pathlib import Path
 from typing import Any
@@ -10,7 +12,7 @@ from mcp.server.mcpserver import AcceptedElicitation, Context, MCPServer
 from mcp.types import ImageContent, TextContent
 from pydantic import BaseModel, Field
 
-from . import imaging
+from . import __version__, imaging, media, video
 from .catalog import (
     ModelCatalog,
     ModelNotFoundError,
@@ -18,6 +20,8 @@ from .catalog import (
     format_endpoints,
     format_model_details,
     format_model_table,
+    format_video_model_details,
+    format_video_model_table,
     max_reference_images,
     model_slug,
 )
@@ -30,15 +34,26 @@ from .results import ResponseParseError
 logger = logging.getLogger(__name__)
 
 INSTRUCTIONS = """\
-Generate and edit images through OpenRouter (Nano Banana, GPT Image, Seedream, Flux, ...).
+Generate and edit images and videos through OpenRouter (Nano Banana, GPT Image, Seedream, Flux,
+Veo, Kling, Seedance, Sora, Wan, ...).
 
-Workflow:
+Images:
 1. `list_image_models` shows which models can produce images; `list_providers` shows which
    upstream providers serve a given model (e.g. Google Vertex vs Google AI Studio).
 2. Ask the user which model and provider they want when it matters, then pass `model` and
    `providers` to `generate_image` or `edit_image`.
 3. Images are written to the output directory and the file path is returned, so they can be
    re-read, committed to a repo, or referenced in later edits.
+
+Videos:
+1. `list_video_models` / `describe_video_model` show durations, resolutions, aspect ratios,
+   which frame images a model accepts and its model-specific `provider_options`.
+2. `generate_video` covers text-to-video, image-to-video (`first_frame` / `last_frame`) and
+   reference-to-video (`reference_images`, plus `reference_videos` / `reference_audios` on
+   models that honour them, e.g. Seedance 2.x). `edit_video` edits, restyles or upscales a clip.
+3. Video jobs are paid and take 30s to several minutes. The tool waits up to a limit; if it
+   returns a job id instead of a file, call `check_video_job` later. Never resubmit a job that
+   is still running - that pays twice.
 
 If no model is given and no default is configured, the tools return a list of candidates
 instead of guessing - present them to the user and ask.
@@ -47,14 +62,14 @@ instead of guessing - present them to the user and ask.
 SELECTION_HINT = (
     "No model was selected. Pick one of the models below, ask the user which one they want, "
     'and call the tool again with `model="<slug>"`. '
-    "You can also set OPENROUTER_IMAGE_MODEL in the server environment to define a default."
+    "You can also set {env} in the server environment to define a default."
 )
 
 server = MCPServer(
     name="openrouter-image",
-    title="OpenRouter Image Generation",
+    title="OpenRouter Image & Video Generation",
     instructions=INSTRUCTIONS,
-    version="0.1.0",
+    version=__version__,
 )
 
 _settings: Settings | None = None
@@ -112,14 +127,16 @@ class NeedsSelection(Exception):
         self.text = text
 
 
-async def _ask_for_model(ctx: Context | None, candidates: list[dict[str, Any]]) -> str | None:
+async def _ask_for_model(
+    ctx: Context | None, candidates: list[dict[str, Any]], kind: str = "image"
+) -> str | None:
     """Try MCP elicitation; returns None when the client does not support it."""
     if ctx is None:
         return None
     preview = ", ".join(model_slug(m) for m in candidates[:8])
     try:
         result = await ctx.elicit(
-            message=f"Which OpenRouter image model should be used? Candidates: {preview}",
+            message=f"Which OpenRouter {kind} model should be used? Candidates: {preview}",
             schema=ModelChoice,
         )
     except Exception as exc:  # client without elicitation support, or user closed it
@@ -149,25 +166,37 @@ async def _ask_for_provider(ctx: Context | None, model: str, endpoints: list[str
     return None
 
 
-async def _resolve_model(model: str, ctx: Context | None) -> str:
+async def _resolve_model(model: str, ctx: Context | None, kind: str = "image") -> str:
     """Turn user input (slug, friendly name or nothing) into a concrete model slug."""
     catalog = get_catalog()
     settings = get_settings()
-    query = (model or "").strip() or (settings.default_model or "")
+    if kind == "video":
+        default, load, resolve = (
+            settings.default_video_model,
+            catalog.video_models,
+            catalog.resolve_video,
+        )
+        table, env = format_video_model_table, "OPENROUTER_VIDEO_MODEL"
+    else:
+        default, load, resolve = settings.default_model, catalog.image_models, catalog.resolve
+        table, env = format_model_table, "OPENROUTER_IMAGE_MODEL"
+    query = (model or "").strip() or (default or "")
 
     if not query:
-        candidates = await catalog.image_models()
-        chosen = await _ask_for_model(ctx, candidates)
+        candidates = await load()
+        chosen = await _ask_for_model(ctx, candidates, kind)
         if not chosen:
-            raise NeedsSelection(f"{SELECTION_HINT}\n\n{format_model_table(candidates, limit=25)}")
+            raise NeedsSelection(
+                f"{SELECTION_HINT.format(env=env)}\n\n{table(candidates, limit=25)}"
+            )
         query = chosen
 
     try:
-        return model_slug(await catalog.resolve(query))
+        return model_slug(await resolve(query))
     except ModelNotFoundError as exc:
         raise NeedsSelection(
-            f"No image model matches `{query}`. Pick one of these and call the tool again:\n\n"
-            f"{format_model_table(exc.candidates, limit=25)}"
+            f"No {kind} model matches `{query}`. Pick one of these and call the tool again:\n\n"
+            f"{table(exc.candidates, limit=25)}"
         ) from exc
 
 
@@ -196,8 +225,10 @@ def _preview_content(saved: Any, settings: Settings, inline: bool) -> ImageConte
     if preview is None:
         return None
     data, media_type = preview
-    import base64
+    return _image_content(data, media_type)
 
+
+def _image_content(data: bytes, media_type: str) -> ImageContent:
     return ImageContent(
         type="image",
         data=base64.b64encode(data).decode("ascii"),
@@ -205,8 +236,8 @@ def _preview_content(saved: Any, settings: Settings, inline: bool) -> ImageConte
     )
 
 
-def _error_text(exc: Exception) -> list[TextContent]:
-    return [TextContent(type="text", text=f"Image generation failed: {exc}")]
+def _error_text(exc: Exception, what: str = "Image generation") -> list[TextContent]:
+    return [TextContent(type="text", text=f"{what} failed: {exc}")]
 
 
 # --------------------------------------------------------------------- tools
@@ -272,12 +303,15 @@ async def list_providers(model: str = "", refresh: bool = False) -> str:
     catalog = get_catalog()
     try:
         if model.strip():
-            resolved = model_slug(await catalog.resolve(model))
+            try:
+                resolved = model_slug(await catalog.resolve(model))
+            except ModelNotFoundError:
+                resolved = model_slug(await catalog.resolve_video(model))
             return format_endpoints(resolved, await catalog.endpoints(resolved, refresh=refresh))
         providers = await get_client().list_providers()
     except ModelNotFoundError as exc:
-        return (
-            f"No image model matches `{model}`.\n\n{format_model_table(exc.candidates, limit=25)}"
+        return f"No image or video model matches `{model}`.\n\n" + format_video_model_table(
+            exc.candidates, limit=25
         )
     except (OpenRouterError, ConfigError) as exc:
         return f"Could not load providers: {exc}"
@@ -474,16 +508,7 @@ async def show_image(path: str, max_pixels: int = 0) -> list[TextContent | Image
             header,
             TextContent(type="text", text="(no inline preview available for this format)"),
         ]
-    import base64
-
-    return [
-        header,
-        ImageContent(
-            type="image",
-            data=base64.b64encode(preview[0]).decode("ascii"),
-            mime_type=preview[1],
-        ),
-    ]
+    return [header, _image_content(*preview)]
 
 
 @server.tool(
@@ -509,6 +534,505 @@ async def list_generated_images(limit: int = 10, save_dir: str = "") -> str:
     return "\n".join(lines)
 
 
+# ------------------------------------------------------------------ video tools
+
+
+def _resume_hint(job_id: str) -> str:
+    return (
+        f'Call `check_video_job(job_id="{job_id}")` to keep waiting and download the result - '
+        "do not resubmit, the job is already paid for."
+    )
+
+
+def _store_record(record: dict[str, Any]) -> None:
+    try:
+        video.save_job_record(get_settings(), record)
+    except OSError as exc:  # a read-only output dir must not lose the result
+        logger.warning("could not store video job record: %s", exc)
+
+
+async def _video_provider_slugs(model: str, provider: str) -> tuple[str, ...]:
+    """Which provider blocks `provider_options` go into."""
+    if provider.strip():
+        return (provider.strip(),)
+    try:
+        data = await get_catalog().endpoints(model)
+    except OpenRouterError:
+        return ()
+    return tuple(endpoint_slug(e) for e in data.get("endpoints") or [] if isinstance(e, dict))
+
+
+async def _video_result(
+    job_id: str,
+    record: dict[str, Any],
+    items: list[tuple[Path, int, str, media.VideoInfo | None]],
+    *,
+    cost: float | None,
+    show_inline: bool,
+    verb: str = "Generated",
+) -> list[TextContent | ImageContent]:
+    settings = get_settings()
+    previews: list[ImageContent] = []
+    if show_inline:
+        for path, _size, _media_type, info in items:
+            sheet = await asyncio.to_thread(
+                media.contact_sheet,
+                path,
+                settings.preview_max_px,
+                duration=info.duration if info else None,
+            )
+            if sheet is not None:
+                previews.append(_image_content(*sheet))
+
+    lines = [f"{verb} {len(items)} video(s) with `{record.get('model') or '?'}` (job `{job_id}`)."]
+    for path, size, media_type, info in items:
+        details = ([info.describe()] if info else []) + [imaging.human_size(size), media_type]
+        lines.append(f"- `{path}` ({', '.join(details)})")
+    if cost is not None:
+        lines.append(f"Cost: ${cost:.4f}")
+    lines.append(f"\nMetadata sidecars: {items[0][0].name}.json (one per video).")
+    if previews:
+        lines.append("Preview: 4 evenly spaced frames per video, left-to-right, top-to-bottom.")
+    elif show_inline and not media.ffmpeg_available():
+        lines.append("(Install ffmpeg to get an inline frame preview.)")
+    return [TextContent(type="text", text="\n".join(lines)), *previews]
+
+
+async def _finish_video_job(
+    job_id: str,
+    record: dict[str, Any],
+    *,
+    max_wait: float,
+    show_inline: bool,
+    ctx: Context | None,
+) -> list[TextContent | ImageContent]:
+    """Poll a submitted job, then download and describe its outputs."""
+    settings = get_settings()
+    client = get_client()
+
+    async def report(status: dict[str, Any], elapsed: float) -> None:
+        if ctx is None:
+            return
+        try:
+            await ctx.report_progress(
+                min(elapsed, max_wait),
+                max_wait,
+                f"video job {status.get('status') or '?'} after {elapsed:.0f}s",
+            )
+        except Exception as exc:  # progress is best effort
+            logger.debug("progress notification failed: %s", exc)
+
+    try:
+        status, elapsed = await video.wait_for_job(
+            client,
+            job_id,
+            interval=settings.video_poll_interval,
+            max_wait=max_wait,
+            on_progress=report,
+        )
+    except (OpenRouterError, ConfigError) as exc:
+        text = f"Could not poll video job `{job_id}`: {exc}\n{_resume_hint(job_id)}"
+        return [TextContent(type="text", text=text)]
+
+    state = str(status.get("status") or "unknown")
+    model = record.get("model") or "?"
+    record["status"] = state
+    if status.get("generation_id"):
+        record["generation_id"] = status["generation_id"]
+    if status.get("error"):
+        record["error"] = status["error"]
+
+    if state not in video.TERMINAL_STATUSES:
+        _store_record(record)
+        text = (
+            f"Video job `{job_id}` (`{model}`) is still `{state}` after {elapsed:.0f}s; it keeps "
+            f"running on OpenRouter.\n{_resume_hint(job_id)}"
+        )
+        return [TextContent(type="text", text=text)]
+
+    cost = video.job_cost(status)
+    if state != "completed":
+        _store_record(record)
+        text = f"Video job `{job_id}` (`{model}`) ended as `{state}`: " + (
+            f"{status.get('error') or 'no reason given'}."
+        )
+        if cost is not None:
+            text += f"\nCost: ${cost:.4f}"
+        return [TextContent(type="text", text=text)]
+
+    record["usage"] = status.get("usage")
+    try:
+        saved = await video.download_outputs(client, settings, status, record)
+    except (OpenRouterError, ConfigError, OSError) as exc:
+        _store_record(record)
+        text = (
+            f"Video job `{job_id}` completed, but saving it failed: {exc}\n"
+            f"{_resume_hint(job_id)}"
+        )
+        return [TextContent(type="text", text=text)]
+
+    record["files"] = [str(item.path) for item in saved]
+    _store_record(record)
+    items = [(s.path, s.size_bytes, s.media_type, s.info) for s in saved]
+    return await _video_result(job_id, record, items, cost=cost, show_inline=show_inline)
+
+
+@server.tool(
+    title="List video models",
+    description=(
+        "List OpenRouter video generation models with price, durations, resolutions, accepted "
+        "frame images and audio support. Use `query` to filter, e.g. 'veo', 'kling', 'seedance'."
+    ),
+)
+async def list_video_models(query: str = "", limit: int = 30, refresh: bool = False) -> str:
+    try:
+        models = await get_catalog().search_videos(query, refresh=refresh)
+    except (OpenRouterError, ConfigError) as exc:
+        return f"Could not load the video model list: {exc}"
+    header = (
+        f"{len(models)} video model(s) matching `{query}`:"
+        if query
+        else f"{len(models)} video models:"
+    )
+    return f"{header}\n\n{format_video_model_table(models, limit=max(1, limit))}"
+
+
+@server.tool(
+    title="Describe video model",
+    description=(
+        "Show everything one video model supports: durations, resolutions, aspect ratios, sizes, "
+        "first/last frame images, audio, seed, upscaling, pricing SKUs, the model-specific "
+        "`provider_options` it accepts (e.g. negativePrompt, cfg_scale) and its providers."
+    ),
+)
+async def describe_video_model(model: str) -> str:
+    catalog = get_catalog()
+    try:
+        resolved = await catalog.resolve_video(model)
+    except ModelNotFoundError as exc:
+        return (
+            f"No video model matches `{model}`.\n\n"
+            f"{format_video_model_table(exc.candidates, limit=30)}"
+        )
+    except (OpenRouterError, ConfigError) as exc:
+        return f"Could not load model details: {exc}"
+
+    slug = model_slug(resolved)
+    text = format_video_model_details(resolved)
+    try:
+        endpoints = await catalog.endpoints(slug)
+        text = (
+            f"{text}\n\n{format_endpoints(slug, endpoints)}\n\n"
+            "For video, a provider slug is only needed as `provider` together with "
+            "`provider_options`, and even then it is looked up automatically."
+        )
+    except OpenRouterError as exc:
+        text = f"{text}\n\n(Provider list unavailable: {exc})"
+    return text
+
+
+@server.tool(
+    title="Generate video",
+    description=(
+        "Generate a video with an OpenRouter video model (Veo 3.1, Kling 3.0, Seedance 2.x, "
+        "Sora 2, Wan, Hailuo, ...) and save it to disk. Modes, combinable where the model "
+        "allows: text-to-video (`prompt`); image-to-video via `first_frame` and/or "
+        "`last_frame`; reference-to-video via `reference_images` (characters, products, "
+        "style), `reference_videos` (motion/camera/effect templates or clips to continue) and "
+        "`reference_audios` (music, sound or voice to sync to) - video and audio references are "
+        "only honoured by models that support them, e.g. Seedance 2.x. All inputs take local "
+        "paths, http URLs or data URLs. `duration`, `resolution`, `aspect_ratio`, `size`, "
+        "`seed`, `generate_audio` are checked against `describe_video_model`; model-specific "
+        "controls go into `provider_options` (e.g. {'personGeneration': 'allow'} for Veo, "
+        "{'cfg_scale': 0.5} for Kling), `negative_prompt` is mapped to the model's spelling. "
+        "Jobs take 30s to minutes: with `wait` the tool polls up to `max_wait_seconds` and "
+        "returns the file path plus a frame preview, otherwise a job id for `check_video_job`."
+    ),
+    structured_output=False,
+)
+async def generate_video(
+    prompt: str = "",
+    model: str = "",
+    duration: int | None = None,
+    resolution: str = "",
+    aspect_ratio: str = "",
+    size: str = "",
+    generate_audio: bool | None = None,
+    seed: int | None = None,
+    first_frame: str = "",
+    last_frame: str = "",
+    reference_images: list[str] | None = None,
+    reference_videos: list[str] | None = None,
+    reference_audios: list[str] | None = None,
+    negative_prompt: str = "",
+    provider_options: dict[str, Any] | None = None,
+    provider: str = "",
+    upscale_factor: float | None = None,
+    creativity: int | None = None,
+    callback_url: str = "",
+    wait: bool = True,
+    max_wait_seconds: int = 0,
+    save_dir: str = "",
+    name_prefix: str = "",
+    inline_preview: bool | None = None,
+    extra_body: dict[str, Any] | None = None,
+    ctx: Context | None = None,
+) -> list[TextContent | ImageContent]:
+    settings = get_settings()
+    try:
+        resolved_model = await _resolve_model(model, ctx, kind="video")
+    except NeedsSelection as exc:
+        return [TextContent(type="text", text=exc.text)]
+    except (OpenRouterError, ConfigError) as exc:
+        return _error_text(exc, "Video generation")
+
+    request = video.VideoRequest(
+        model=resolved_model,
+        prompt=prompt,
+        duration=duration,
+        resolution=resolution or None,
+        aspect_ratio=aspect_ratio or None,
+        size=size or None,
+        generate_audio=generate_audio,
+        seed=seed,
+        first_frame=first_frame or None,
+        last_frame=last_frame or None,
+        reference_images=tuple(reference_images or ()),
+        reference_videos=tuple(reference_videos or ()),
+        reference_audios=tuple(reference_audios or ()),
+        negative_prompt=negative_prompt or None,
+        provider_options=dict(provider_options or {}),
+        upscale_factor=upscale_factor,
+        creativity=creativity,
+        callback_url=callback_url or None,
+        extra=dict(extra_body or {}),
+    )
+    output_dir = Path(save_dir).expanduser() if save_dir else None
+    try:
+        model_info = await get_catalog().resolve_video(resolved_model)
+        slugs = (
+            await _video_provider_slugs(resolved_model, provider)
+            if request.needs_provider_slug
+            else ()
+        )
+        payload = video.build_video_payload(request, model_info, slugs)
+        job = await get_client().create_video(payload)
+    except (
+        OpenRouterError,
+        ConfigError,
+        ImageFileError,
+        ModelNotFoundError,
+        ValueError,
+    ) as exc:
+        return _error_text(exc, "Video generation")
+
+    job_id = str(job["id"])
+    record = video.new_job_record(
+        job, request, save_dir=output_dir, name_prefix=name_prefix or None
+    )
+    _store_record(record)
+    if not wait:
+        text = (
+            f"Submitted video job `{job_id}` with `{resolved_model}` (status "
+            f"`{record['status']}`). Generation usually takes 30 seconds to several minutes.\n"
+            f"{_resume_hint(job_id)}"
+        )
+        return [TextContent(type="text", text=text)]
+
+    show_inline = settings.inline_preview if inline_preview is None else inline_preview
+    max_wait = float(max_wait_seconds) if max_wait_seconds > 0 else settings.video_max_wait
+    return await _finish_video_job(
+        job_id, record, max_wait=max_wait, show_inline=show_inline, ctx=ctx
+    )
+
+
+@server.tool(
+    title="Edit video",
+    description=(
+        "Edit, restyle, extend or upscale an existing clip: `source_video` (local path, http URL "
+        "or data URL) is sent as the leading video reference, plus an instruction in `prompt`. "
+        "Pick a model that takes video input - e.g. black-forest-labs/flux-video-edit, "
+        "runway/aleph-2, Seedance 2.x for reference-driven remakes, or "
+        "black-forest-labs/flux-video-upscale with `upscale_factor` / `creativity`. "
+        "Waits and saves like `generate_video`."
+    ),
+    structured_output=False,
+)
+async def edit_video(
+    source_video: str,
+    prompt: str = "",
+    model: str = "",
+    reference_images: list[str] | None = None,
+    reference_audios: list[str] | None = None,
+    duration: int | None = None,
+    resolution: str = "",
+    aspect_ratio: str = "",
+    seed: int | None = None,
+    upscale_factor: float | None = None,
+    creativity: int | None = None,
+    negative_prompt: str = "",
+    provider_options: dict[str, Any] | None = None,
+    provider: str = "",
+    wait: bool = True,
+    max_wait_seconds: int = 0,
+    save_dir: str = "",
+    name_prefix: str = "",
+    inline_preview: bool | None = None,
+    extra_body: dict[str, Any] | None = None,
+    ctx: Context | None = None,
+) -> list[TextContent | ImageContent]:
+    if not source_video.strip():
+        return [TextContent(type="text", text="edit_video needs a `source_video`.")]
+    return await generate_video(
+        prompt=prompt,
+        model=model,
+        duration=duration,
+        resolution=resolution,
+        aspect_ratio=aspect_ratio,
+        seed=seed,
+        reference_images=reference_images,
+        reference_videos=[source_video],
+        reference_audios=reference_audios,
+        negative_prompt=negative_prompt,
+        provider_options=provider_options,
+        provider=provider,
+        upscale_factor=upscale_factor,
+        creativity=creativity,
+        wait=wait,
+        max_wait_seconds=max_wait_seconds,
+        save_dir=save_dir,
+        name_prefix=name_prefix or "edit",
+        inline_preview=inline_preview,
+        extra_body=extra_body,
+        ctx=ctx,
+    )
+
+
+@server.tool(
+    title="Check video job",
+    description=(
+        "Resume a video job that `generate_video` / `edit_video` returned as a job id: polls "
+        "its status (waiting up to `max_wait_seconds` when `wait` is true) and downloads the "
+        "finished video. Calling it again for a downloaded job just returns the saved files."
+    ),
+    structured_output=False,
+)
+async def check_video_job(
+    job_id: str,
+    wait: bool = True,
+    max_wait_seconds: int = 0,
+    save_dir: str = "",
+    inline_preview: bool | None = None,
+    ctx: Context | None = None,
+) -> list[TextContent | ImageContent]:
+    settings = get_settings()
+    job_id = job_id.strip()
+    if not job_id:
+        return [TextContent(type="text", text="`job_id` is required.")]
+    record = video.load_job_record(settings, job_id) or {"job_id": job_id}
+    if save_dir:
+        record["save_dir"] = str(Path(save_dir).expanduser())
+    show_inline = settings.inline_preview if inline_preview is None else inline_preview
+
+    files = [Path(p) for p in record.get("files") or []]
+    if files and all(p.is_file() for p in files):
+        items = []
+        for path in files:
+            info = await asyncio.to_thread(media.probe_video, path)
+            media_type = media.guess_media_type(path) or "video/mp4"
+            items.append((path, path.stat().st_size, media_type, info))
+        return await _video_result(
+            job_id,
+            record,
+            items,
+            cost=video.job_cost(record),
+            show_inline=show_inline,
+            verb="Already downloaded",
+        )
+
+    if wait:
+        max_wait = float(max_wait_seconds) if max_wait_seconds > 0 else settings.video_max_wait
+    else:
+        max_wait = 0.0
+    return await _finish_video_job(
+        job_id, record, max_wait=max_wait, show_inline=show_inline, ctx=ctx
+    )
+
+
+@server.tool(
+    title="List generated videos",
+    description=(
+        "List unfinished video jobs (resume them with `check_video_job`) and the most recently "
+        "saved videos."
+    ),
+)
+async def list_generated_videos(limit: int = 10, save_dir: str = "") -> str:
+    settings = get_settings()
+    directory = Path(save_dir).expanduser() if save_dir else settings.videos_dir
+    lines: list[str] = []
+
+    records = video.list_job_records(settings)
+    pending = [r for r in records if r.get("status") not in video.TERMINAL_STATUSES]
+    if pending:
+        lines.append("Unfinished video jobs (resume with `check_video_job`):")
+        for record in pending:
+            prompt = str(record.get("prompt") or "")[:80]
+            lines.append(
+                f"- `{record['job_id']}` - `{record.get('model') or '?'}`, "
+                f"{record.get('status')}, submitted {record.get('created_at') or '?'}: {prompt}"
+            )
+        lines.append("")
+
+    extensions = set(media.VIDEO_EXTENSIONS.values())
+    files = (
+        [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in extensions]
+        if directory.is_dir()
+        else []
+    )
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        lines.append(f"No videos in `{directory}` yet.")
+        return "\n".join(lines)
+    lines.append(f"Most recent videos in `{directory}`:")
+    for path in files[: max(1, limit)]:
+        lines.append(f"- `{path}` ({imaging.human_size(path.stat().st_size)})")
+    return "\n".join(lines)
+
+
+@server.tool(
+    title="Show video",
+    description=(
+        "Inspect a local video file: duration, resolution, audio track, plus an inline preview "
+        "of 4 evenly spaced frames. Works for generated clips and for reference videos. "
+        "Needs ffmpeg for the preview."
+    ),
+    structured_output=False,
+)
+async def show_video(path: str, max_pixels: int = 0) -> list[TextContent | ImageContent]:
+    settings = get_settings()
+    file = Path(path).expanduser()
+    if not file.is_file():
+        return [TextContent(type="text", text=f"No such video: {file}")]
+    info = await asyncio.to_thread(media.probe_video, file)
+    header = (
+        f"`{file}` - {media.guess_media_type(file) or 'unknown type'}, "
+        f"{imaging.human_size(file.stat().st_size)}" + (f", {info.describe()}" if info else "")
+    )
+    sheet = await asyncio.to_thread(
+        media.contact_sheet,
+        file,
+        max_pixels or settings.preview_max_px,
+        duration=info.duration if info else None,
+    )
+    if sheet is None:
+        reason = "the file could not be decoded" if media.ffmpeg_available() else "install ffmpeg"
+        return [
+            TextContent(type="text", text=header),
+            TextContent(type="text", text=f"(no preview - {reason})"),
+        ]
+    return [TextContent(type="text", text=header), _image_content(*sheet)]
+
+
 @server.tool(
     title="OpenRouter status",
     description="Show the configured defaults plus the API key's credit/limit information.",
@@ -523,6 +1047,11 @@ async def openrouter_status() -> str:
         f"- allow provider fallbacks: {settings.allow_fallbacks}",
         f"- output directory: `{settings.output_dir}`",
         f"- inline previews: {settings.inline_preview} (max {settings.preview_max_px}px)",
+        f"- default video model: `{settings.default_video_model or '(none - the user is asked)'}`",
+        f"- video output directory: `{settings.videos_dir}`",
+        f"- video polling: every {settings.video_poll_interval:.0f}s, "
+        f"waiting up to {settings.video_max_wait:.0f}s per call",
+        f"- ffmpeg (video previews): {'yes' if media.ffmpeg_available() else 'not found'}",
         f"- API key configured: {'yes' if settings.api_key else 'NO - set OPENROUTER_API_KEY'}",
     ]
     try:
@@ -551,3 +1080,17 @@ async def image_models_resource() -> str:
     except (OpenRouterError, ConfigError) as exc:
         return f"Could not load the model list: {exc}"
     return format_model_table(models)
+
+
+@server.resource(
+    "openrouter://video-models",
+    name="OpenRouter video models",
+    description="Markdown table of all video models with capabilities and pricing.",
+    mime_type="text/markdown",
+)
+async def video_models_resource() -> str:
+    try:
+        models = await get_catalog().video_models()
+    except (OpenRouterError, ConfigError) as exc:
+        return f"Could not load the video model list: {exc}"
+    return format_video_model_table(models)
